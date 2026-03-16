@@ -315,6 +315,69 @@ func (s *DoltStore) GetReadyWork(ctx context.Context, filter types.WorkFilter) (
 	return issues, nil
 }
 
+type dependencyIssueState struct {
+	status      types.Status
+	closeReason string
+}
+
+func (s *DoltStore) loadIssueStates(ctx context.Context, issueTables []string, ids []string) (map[string]dependencyIssueState, error) {
+	states := make(map[string]dependencyIssueState)
+	if len(ids) == 0 {
+		return states, nil
+	}
+
+	seen := make(map[string]struct{}, len(ids))
+	uniqueIDs := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		uniqueIDs = append(uniqueIDs, id)
+	}
+
+	for _, table := range issueTables {
+		for start := 0; start < len(uniqueIDs); start += queryBatchSize {
+			end := start + queryBatchSize
+			if end > len(uniqueIDs) {
+				end = len(uniqueIDs)
+			}
+			placeholders, args := doltBuildSQLInClause(uniqueIDs[start:end])
+
+			//nolint:gosec // G201: table is hardcoded and placeholders contains only ? markers
+			rows, err := s.queryContext(ctx, fmt.Sprintf(`
+				SELECT id, status, COALESCE(close_reason, '')
+				FROM %s
+				WHERE id IN (%s)
+			`, table, placeholders), args...)
+			if err != nil {
+				if isTableNotExistError(err) {
+					continue
+				}
+				return nil, wrapQueryError("load issue states from "+table, err)
+			}
+
+			for rows.Next() {
+				var id, status, closeReason string
+				if err := rows.Scan(&id, &status, &closeReason); err != nil {
+					_ = rows.Close()
+					return nil, wrapScanError("load issue states: scan", err)
+				}
+				states[id] = dependencyIssueState{
+					status:      types.Status(status),
+					closeReason: closeReason,
+				}
+			}
+			_ = rows.Close()
+			if err := rows.Err(); err != nil {
+				return nil, wrapQueryError("load issue states: rows from "+table, err)
+			}
+		}
+	}
+
+	return states, nil
+}
+
 // GetBlockedIssues returns issues that are blocked by other issues.
 // Uses separate single-table queries with Go-level filtering to avoid
 // correlated EXISTS subqueries that trigger Dolt's joinIter panic
@@ -379,11 +442,16 @@ func (s *DoltStore) GetBlockedIssues(ctx context.Context, filter types.WorkFilte
 
 	// Step 3: Get blocking + waits-for + conditional-blocks deps to build BlockedBy lists
 	// Scan both dependencies and wisp_dependencies tables (bd-w2w)
+	type blockerRecord struct {
+		issueID, blockerID, depType string
+	}
+	var depRecords []blockerRecord
+	var conditionalBlockerIDs []string
 	blockerMap := make(map[string][]string)
 	for _, depTable := range []string{"dependencies", "wisp_dependencies"} {
 		//nolint:gosec // G201: depTable is hardcoded to "dependencies" or "wisp_dependencies"
 		depRows, err := s.queryContext(ctx, fmt.Sprintf(`
-			SELECT issue_id, depends_on_id FROM %s
+			SELECT issue_id, depends_on_id, type FROM %s
 			WHERE type IN ('blocks', 'waits-for', 'conditional-blocks')
 		`, depTable))
 		if err != nil {
@@ -391,19 +459,46 @@ func (s *DoltStore) GetBlockedIssues(ctx context.Context, filter types.WorkFilte
 		}
 
 		for depRows.Next() {
-			var issueID, blockerID string
-			if err := depRows.Scan(&issueID, &blockerID); err != nil {
+			var issueID, blockerID, depType string
+			if err := depRows.Scan(&issueID, &blockerID, &depType); err != nil {
 				_ = depRows.Close() // Best effort cleanup on error path
 				return nil, wrapScanError("get blocked issues: scan dependency", err)
 			}
-			// Only include if computeBlockedIDs confirmed this issue is blocked
-			if blockedSet[issueID] && activeIDs[blockerID] {
-				blockerMap[issueID] = append(blockerMap[issueID], blockerID)
+			depRecords = append(depRecords, blockerRecord{
+				issueID:   issueID,
+				blockerID: blockerID,
+				depType:   depType,
+			})
+			if depType == string(types.DepConditionalBlocks) {
+				conditionalBlockerIDs = append(conditionalBlockerIDs, blockerID)
 			}
 		}
 		_ = depRows.Close() // Redundant close for safety (rows already iterated)
 		if err := depRows.Err(); err != nil {
 			return nil, wrapQueryError("get blocked issues: dependency rows", err)
+		}
+	}
+
+	issueStates, err := s.loadIssueStates(ctx, []string{"issues", "wisps"}, conditionalBlockerIDs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load conditional blocker states: %w", err)
+	}
+
+	for _, rec := range depRecords {
+		if !blockedSet[rec.issueID] {
+			continue
+		}
+
+		switch rec.depType {
+		case string(types.DepBlocks), string(types.DepWaitsFor):
+			if activeIDs[rec.blockerID] {
+				blockerMap[rec.issueID] = append(blockerMap[rec.issueID], rec.blockerID)
+			}
+		case string(types.DepConditionalBlocks):
+			state, ok := issueStates[rec.blockerID]
+			if ok && types.ConditionalBlocksReadyBlocked(state.status, state.closeReason) {
+				blockerMap[rec.issueID] = append(blockerMap[rec.issueID], rec.blockerID)
+			}
 		}
 	}
 
@@ -738,7 +833,7 @@ func (s *DoltStore) computeBlockedIDs(ctx context.Context, includeWisps bool) ([
 		depTables = append(depTables, "wisp_dependencies")
 	}
 
-	// Step 1: Get all active issue IDs
+	// Step 1: Get all active issue IDs.
 	activeIDs := make(map[string]bool)
 	for _, table := range issueTables {
 		//nolint:gosec // G201: table is hardcoded to "issues" or "wisps"
@@ -805,16 +900,32 @@ func (s *DoltStore) computeBlockedIDs(ctx context.Context, includeWisps bool) ([
 	}
 	var waitsForDeps []waitsForDep
 	needsClosedChildren := false
+	var conditionalBlockerIDs []string
+	for _, rec := range allDeps {
+		if rec.depType == string(types.DepConditionalBlocks) {
+			conditionalBlockerIDs = append(conditionalBlockerIDs, rec.dependsOnID)
+		}
+	}
+
+	issueStates, err := s.loadIssueStates(ctx, issueTables, conditionalBlockerIDs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load conditional blocker states: %w", err)
+	}
 
 	// Step 3: Filter direct blockers in Go; collect waits-for edges
 	blockedSet := make(map[string]bool)
 	for _, rec := range allDeps {
 		switch rec.depType {
-		case string(types.DepBlocks), string(types.DepConditionalBlocks):
-			// Both blocks and conditional-blocks gate readiness while the
-			// blocker is active. For conditional-blocks ("B runs only if A
-			// fails"), B cannot be ready while A's outcome is still unknown.
+		case string(types.DepBlocks):
 			if activeIDs[rec.issueID] && activeIDs[rec.dependsOnID] {
+				blockedSet[rec.issueID] = true
+			}
+		case string(types.DepConditionalBlocks):
+			if !activeIDs[rec.issueID] {
+				continue
+			}
+			state, ok := issueStates[rec.dependsOnID]
+			if ok && types.ConditionalBlocksReadyBlocked(state.status, state.closeReason) {
 				blockedSet[rec.issueID] = true
 			}
 		case string(types.DepWaitsFor):

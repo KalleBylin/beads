@@ -1005,6 +1005,47 @@ func TestDiscovery_ConditionalBlocksNotEvaluated(t *testing.T) {
 	}
 }
 
+// TestDiscovery_ConditionalBlocksFailureCloseUnblocks verifies the documented
+// post-close failure path: the fallback becomes ready when the precondition
+// closes with a failure reason.
+func TestDiscovery_ConditionalBlocksFailureCloseUnblocks(t *testing.T) {
+	w := newCandidateWorkspace(t)
+
+	precondition := w.create("--title", "Precondition (may fail)", "--type", "task", "--priority", "1")
+	fallback := w.create("--title", "Fallback (runs on failure)", "--type", "task", "--priority", "2")
+
+	w.run("dep", "add", fallback, precondition, "--type", "conditional-blocks")
+	w.run("close", precondition, "--reason", "failed")
+
+	readyIDs := parseIDs(t, w.run("ready", "-n", "0", "--json"))
+	if !containsID(readyIDs, fallback) {
+		t.Errorf("DISCOVERY: fallback %s should become ready after failure-closing precondition %s", fallback, precondition)
+	}
+}
+
+// TestDiscovery_ConditionalBlocksSuccessCloseKeepsFallbackBlocked verifies the
+// complementary post-close success path: the fallback does not become ready
+// when the precondition completes successfully.
+func TestDiscovery_ConditionalBlocksSuccessCloseKeepsFallbackBlocked(t *testing.T) {
+	w := newCandidateWorkspace(t)
+
+	precondition := w.create("--title", "Precondition (succeeds)", "--type", "task", "--priority", "1")
+	fallback := w.create("--title", "Fallback (runs on failure)", "--type", "task", "--priority", "2")
+
+	w.run("dep", "add", fallback, precondition, "--type", "conditional-blocks")
+	w.run("close", precondition, "--reason", "Completed")
+
+	readyIDs := parseIDs(t, w.run("ready", "-n", "0", "--json"))
+	if containsID(readyIDs, fallback) {
+		t.Errorf("DISCOVERY: fallback %s incorrectly becomes ready after successful close of %s", fallback, precondition)
+	}
+
+	blockedIDs := parseIDs(t, w.run("blocked", "--json"))
+	if !containsID(blockedIDs, fallback) {
+		t.Errorf("DISCOVERY: fallback %s should remain in bd blocked after successful close of %s", fallback, precondition)
+	}
+}
+
 // NOTE: Wisp dep type overwrite (same root cause as BUG-7 but in
 // wisp_dependencies table) confirmed via code review but not tested here
 // because ephemeral issue dep routing requires different test setup.

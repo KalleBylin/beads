@@ -233,6 +233,123 @@ func TestGetReadyWork_ExcludesBlockedIssues(t *testing.T) {
 	}
 }
 
+func TestGetReadyWork_ConditionalBlocksFailureCloseUnblocks(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	precondition := &types.Issue{
+		ID:        "rw-cond-fail-pre",
+		Title:     "Precondition",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+	}
+	fallback := &types.Issue{
+		ID:        "rw-cond-fail-fallback",
+		Title:     "Fallback",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+
+	for _, iss := range []*types.Issue{precondition, fallback} {
+		if err := store.CreateIssue(ctx, iss, "tester"); err != nil {
+			t.Fatalf("failed to create issue: %v", err)
+		}
+	}
+
+	if err := store.AddDependency(ctx, &types.Dependency{
+		IssueID:     fallback.ID,
+		DependsOnID: precondition.ID,
+		Type:        types.DepConditionalBlocks,
+	}, "tester"); err != nil {
+		t.Fatalf("failed to add dependency: %v", err)
+	}
+
+	beforeClose, err := store.GetReadyWork(ctx, types.WorkFilter{})
+	if err != nil {
+		t.Fatalf("GetReadyWork before close: %v", err)
+	}
+	for _, issue := range beforeClose {
+		if issue.ID == fallback.ID {
+			t.Fatal("fallback should not be ready while precondition is open")
+		}
+	}
+
+	if err := store.CloseIssue(ctx, precondition.ID, "failed", "tester", "s1"); err != nil {
+		t.Fatalf("failed to close precondition: %v", err)
+	}
+
+	afterClose, err := store.GetReadyWork(ctx, types.WorkFilter{})
+	if err != nil {
+		t.Fatalf("GetReadyWork after close: %v", err)
+	}
+
+	foundFallback := false
+	for _, issue := range afterClose {
+		if issue.ID == fallback.ID {
+			foundFallback = true
+		}
+	}
+	if !foundFallback {
+		t.Fatal("fallback should become ready after failure close")
+	}
+}
+
+func TestGetReadyWork_ConditionalBlocksSuccessCloseKeepsBlocked(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	precondition := &types.Issue{
+		ID:        "rw-cond-success-pre",
+		Title:     "Precondition",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+	}
+	fallback := &types.Issue{
+		ID:        "rw-cond-success-fallback",
+		Title:     "Fallback",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+
+	for _, iss := range []*types.Issue{precondition, fallback} {
+		if err := store.CreateIssue(ctx, iss, "tester"); err != nil {
+			t.Fatalf("failed to create issue: %v", err)
+		}
+	}
+
+	if err := store.AddDependency(ctx, &types.Dependency{
+		IssueID:     fallback.ID,
+		DependsOnID: precondition.ID,
+		Type:        types.DepConditionalBlocks,
+	}, "tester"); err != nil {
+		t.Fatalf("failed to add dependency: %v", err)
+	}
+
+	if err := store.CloseIssue(ctx, precondition.ID, "Completed", "tester", "s1"); err != nil {
+		t.Fatalf("failed to close precondition: %v", err)
+	}
+
+	ready, err := store.GetReadyWork(ctx, types.WorkFilter{})
+	if err != nil {
+		t.Fatalf("GetReadyWork after close: %v", err)
+	}
+	for _, issue := range ready {
+		if issue.ID == fallback.ID {
+			t.Fatal("fallback should stay blocked after successful close")
+		}
+	}
+}
+
 func TestGetReadyWork_UnassignedFilter(t *testing.T) {
 	store, cleanup := setupTestStore(t)
 	defer cleanup()
@@ -541,6 +658,69 @@ func TestGetBlockedIssues_ExcludesClosedBlockers(t *testing.T) {
 		if bi.Issue.ID == blocked.ID {
 			t.Error("issue should not be blocked when its blocker is closed")
 		}
+	}
+}
+
+func TestGetBlockedIssues_ConditionalBlocksSuccessCloseRemainsBlocked(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	precondition := &types.Issue{
+		ID:        "bi-cond-success-pre",
+		Title:     "Precondition",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+	}
+	fallback := &types.Issue{
+		ID:        "bi-cond-success-fallback",
+		Title:     "Fallback",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+
+	for _, iss := range []*types.Issue{precondition, fallback} {
+		if err := store.CreateIssue(ctx, iss, "tester"); err != nil {
+			t.Fatalf("failed to create issue: %v", err)
+		}
+	}
+
+	if err := store.AddDependency(ctx, &types.Dependency{
+		IssueID:     fallback.ID,
+		DependsOnID: precondition.ID,
+		Type:        types.DepConditionalBlocks,
+	}, "tester"); err != nil {
+		t.Fatalf("failed to add dependency: %v", err)
+	}
+
+	if err := store.CloseIssue(ctx, precondition.ID, "Completed", "tester", "s1"); err != nil {
+		t.Fatalf("failed to close precondition: %v", err)
+	}
+
+	results, err := store.GetBlockedIssues(ctx, types.WorkFilter{})
+	if err != nil {
+		t.Fatalf("GetBlockedIssues failed: %v", err)
+	}
+
+	found := false
+	for _, bi := range results {
+		if bi.Issue.ID != fallback.ID {
+			continue
+		}
+		found = true
+		if bi.BlockedByCount != 1 {
+			t.Fatalf("expected 1 blocker, got %d", bi.BlockedByCount)
+		}
+		if len(bi.BlockedBy) != 1 || bi.BlockedBy[0] != precondition.ID {
+			t.Fatalf("expected blocker %s, got %v", precondition.ID, bi.BlockedBy)
+		}
+	}
+	if !found {
+		t.Fatal("fallback should remain in blocked output after successful close")
 	}
 }
 

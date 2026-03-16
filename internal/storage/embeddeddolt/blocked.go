@@ -26,7 +26,7 @@ func computeBlockedIDs(ctx context.Context, tx *sql.Tx, includeWisps bool) ([]st
 		depTables = append(depTables, "wisp_dependencies")
 	}
 
-	activeIDs, err := getActiveIDs(ctx, tx, issueTables)
+	activeIDs, issueStates, err := getIssueStates(ctx, tx, issueTables)
 	if err != nil {
 		return nil, err
 	}
@@ -36,7 +36,7 @@ func computeBlockedIDs(ctx context.Context, tx *sql.Tx, includeWisps bool) ([]st
 		return nil, err
 	}
 
-	blockedSet, waitsForDeps, needsClosedChildren := classifyDeps(allDeps, activeIDs)
+	blockedSet, waitsForDeps, needsClosedChildren := classifyDeps(allDeps, activeIDs, issueStates)
 
 	if len(waitsForDeps) > 0 {
 		if err := evaluateWaitsForGates(ctx, tx, waitsForDeps, needsClosedChildren, activeIDs, depTables, issueTables, blockedSet); err != nil {
@@ -47,30 +47,43 @@ func computeBlockedIDs(ctx context.Context, tx *sql.Tx, includeWisps bool) ([]st
 	return mapKeys(blockedSet), nil
 }
 
-// getActiveIDs returns IDs of all issues with status NOT IN (closed, pinned).
-func getActiveIDs(ctx context.Context, tx *sql.Tx, issueTables []string) (map[string]bool, error) {
+type issueState struct {
+	status      types.Status
+	closeReason string
+}
+
+// getIssueStates returns issue lifecycle state for all scanned tables plus the
+// subset that are currently active (status not in closed/pinned).
+func getIssueStates(ctx context.Context, tx *sql.Tx, issueTables []string) (map[string]bool, map[string]issueState, error) {
 	activeIDs := make(map[string]bool)
+	issueStates := make(map[string]issueState)
 	for _, table := range issueTables {
 		//nolint:gosec // G201: table is hardcoded to "issues" or "wisps"
 		rows, err := tx.QueryContext(ctx, fmt.Sprintf(
-			`SELECT id FROM %s WHERE status NOT IN ('closed', 'pinned')`, table))
+			`SELECT id, status, COALESCE(close_reason, '') FROM %s`, table))
 		if err != nil {
-			return nil, fmt.Errorf("compute blocked IDs: active issues from %s: %w", table, err)
+			return nil, nil, fmt.Errorf("compute blocked IDs: issue states from %s: %w", table, err)
 		}
 		for rows.Next() {
-			var id string
-			if err := rows.Scan(&id); err != nil {
+			var id, status, closeReason string
+			if err := rows.Scan(&id, &status, &closeReason); err != nil {
 				rows.Close()
-				return nil, fmt.Errorf("compute blocked IDs: scan active issue: %w", err)
+				return nil, nil, fmt.Errorf("compute blocked IDs: scan issue state: %w", err)
 			}
-			activeIDs[id] = true
+			issueStates[id] = issueState{
+				status:      types.Status(status),
+				closeReason: closeReason,
+			}
+			if status != string(types.StatusClosed) && status != string(types.StatusPinned) {
+				activeIDs[id] = true
+			}
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
-			return nil, fmt.Errorf("compute blocked IDs: active rows from %s: %w", table, err)
+			return nil, nil, fmt.Errorf("compute blocked IDs: issue state rows from %s: %w", table, err)
 		}
 	}
-	return activeIDs, nil
+	return activeIDs, issueStates, nil
 }
 
 // depRecord holds a single blocking dependency row.
@@ -117,12 +130,20 @@ type waitsForDep struct {
 // classifyDeps partitions deps into directly-blocked IDs and waits-for edges
 // that need gate evaluation. Returns the blocked set, the waits-for edges,
 // and whether any gate requires closed-child lookups.
-func classifyDeps(allDeps []depRecord, activeIDs map[string]bool) (blockedSet map[string]bool, waitsFor []waitsForDep, needsClosedChildren bool) {
+func classifyDeps(allDeps []depRecord, activeIDs map[string]bool, issueStates map[string]issueState) (blockedSet map[string]bool, waitsFor []waitsForDep, needsClosedChildren bool) {
 	blockedSet = make(map[string]bool)
 	for _, rec := range allDeps {
 		switch rec.depType {
-		case string(types.DepBlocks), string(types.DepConditionalBlocks):
+		case string(types.DepBlocks):
 			if activeIDs[rec.issueID] && activeIDs[rec.dependsOnID] {
+				blockedSet[rec.issueID] = true
+			}
+		case string(types.DepConditionalBlocks):
+			if !activeIDs[rec.issueID] {
+				continue
+			}
+			state, ok := issueStates[rec.dependsOnID]
+			if ok && types.ConditionalBlocksReadyBlocked(state.status, state.closeReason) {
 				blockedSet[rec.issueID] = true
 			}
 		case string(types.DepWaitsFor):

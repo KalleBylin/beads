@@ -825,6 +825,26 @@ func IsFailureClose(closeReason string) bool {
 	return false
 }
 
+// ConditionalBlocksReadyBlocked returns true when a conditional-blocks
+// dependency should keep the dependent blocked.
+//
+// Semantics:
+//   - while the blocker is still active, the dependent stays blocked
+//   - if the blocker closes with a failure reason, the dependent unblocks
+//   - if the blocker closes successfully, the dependent remains blocked
+func ConditionalBlocksReadyBlocked(status Status, closeReason string) bool {
+	switch status {
+	case "":
+		return false
+	case StatusClosed:
+		return !IsFailureClose(closeReason)
+	case StatusPinned:
+		return false
+	default:
+		return true
+	}
+}
+
 // Label represents a tag on an issue
 type Label struct {
 	IssueID string `json:"issue_id"`

@@ -2615,6 +2615,67 @@ func TestAnalyzeMoleculeParallelCompletedBlockers(t *testing.T) {
 	}
 }
 
+func TestAnalyzeMoleculeParallelConditionalBlocksPostClose(t *testing.T) {
+	root := &types.Issue{
+		ID:        "mol-cond",
+		Title:     "Conditional Molecule",
+		Status:    types.StatusOpen,
+		IssueType: types.TypeEpic,
+	}
+	precondition := &types.Issue{
+		ID:          "mol-cond.precondition",
+		Title:       "Precondition",
+		Status:      types.StatusClosed,
+		CloseReason: "Completed",
+		IssueType:   types.TypeTask,
+	}
+	fallback := &types.Issue{
+		ID:        "mol-cond.fallback",
+		Title:     "Fallback",
+		Status:    types.StatusOpen,
+		IssueType: types.TypeTask,
+	}
+
+	subgraph := &MoleculeSubgraph{
+		Root:   root,
+		Issues: []*types.Issue{root, precondition, fallback},
+		IssueMap: map[string]*types.Issue{
+			root.ID:         root,
+			precondition.ID: precondition,
+			fallback.ID:     fallback,
+		},
+		Dependencies: []*types.Dependency{
+			{IssueID: precondition.ID, DependsOnID: root.ID, Type: types.DepParentChild},
+			{IssueID: fallback.ID, DependsOnID: root.ID, Type: types.DepParentChild},
+			{IssueID: fallback.ID, DependsOnID: precondition.ID, Type: types.DepConditionalBlocks},
+		},
+	}
+
+	t.Run("successful close keeps fallback blocked", func(t *testing.T) {
+		precondition.CloseReason = "Completed"
+		analysis := analyzeMoleculeParallel(subgraph)
+		fallbackInfo := analysis.Steps[fallback.ID]
+		if fallbackInfo.IsReady {
+			t.Fatal("fallback should stay blocked after successful close")
+		}
+		if len(fallbackInfo.BlockedBy) != 1 || fallbackInfo.BlockedBy[0] != precondition.ID {
+			t.Fatalf("Fallback.BlockedBy = %v, want [%s]", fallbackInfo.BlockedBy, precondition.ID)
+		}
+	})
+
+	t.Run("failure close unblocks fallback", func(t *testing.T) {
+		precondition.CloseReason = "failed"
+		analysis := analyzeMoleculeParallel(subgraph)
+		fallbackInfo := analysis.Steps[fallback.ID]
+		if !fallbackInfo.IsReady {
+			t.Fatal("fallback should become ready after failure close")
+		}
+		if len(fallbackInfo.BlockedBy) != 0 {
+			t.Fatalf("Fallback.BlockedBy = %v, want empty after failure close", fallbackInfo.BlockedBy)
+		}
+	})
+}
+
 func TestAnalyzeMoleculeParallelWaitsForChildrenOfSpawner(t *testing.T) {
 	root := &types.Issue{
 		ID:        "mol-fanout",

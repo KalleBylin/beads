@@ -190,8 +190,23 @@ func analyzeMoleculeParallel(subgraph *MoleculeSubgraph) *ParallelAnalysis {
 	// Process dependencies to find blocking relationships
 	for _, dep := range subgraph.Dependencies {
 		switch dep.Type {
-		case types.DepBlocks, types.DepConditionalBlocks:
+		case types.DepBlocks:
+			blocker := subgraph.IssueMap[dep.DependsOnID]
+			if blocker == nil || blocker.Status == types.StatusClosed {
+				continue
+			}
 			// dep.IssueID depends on (is blocked by) dep.DependsOnID
+			if _, ok := blockedBy[dep.IssueID]; ok {
+				blockedBy[dep.IssueID][dep.DependsOnID] = true
+			}
+			if _, ok := blocks[dep.DependsOnID]; ok {
+				blocks[dep.DependsOnID][dep.IssueID] = true
+			}
+		case types.DepConditionalBlocks:
+			blocker := subgraph.IssueMap[dep.DependsOnID]
+			if blocker == nil || !types.ConditionalBlocksReadyBlocked(blocker.Status, blocker.CloseReason) {
+				continue
+			}
 			if _, ok := blockedBy[dep.IssueID]; ok {
 				blockedBy[dep.IssueID][dep.DependsOnID] = true
 			}
@@ -236,7 +251,7 @@ func analyzeMoleculeParallel(subgraph *MoleculeSubgraph) *ParallelAnalysis {
 		}
 	}
 
-	// Identify which steps are ready (no open blockers)
+	// Identify which steps are ready (no current blockers)
 	readySteps := make(map[string]bool)
 	for _, issue := range subgraph.Issues {
 		info := &ParallelInfo{
@@ -248,10 +263,7 @@ func analyzeMoleculeParallel(subgraph *MoleculeSubgraph) *ParallelAnalysis {
 
 		// Check what blocks this step
 		for blockerID := range blockedBy[issue.ID] {
-			blocker := subgraph.IssueMap[blockerID]
-			if blocker != nil && blocker.Status != types.StatusClosed {
-				info.BlockedBy = append(info.BlockedBy, blockerID)
-			}
+			info.BlockedBy = append(info.BlockedBy, blockerID)
 		}
 
 		// Check what this step blocks
@@ -259,7 +271,7 @@ func analyzeMoleculeParallel(subgraph *MoleculeSubgraph) *ParallelAnalysis {
 			info.Blocks = append(info.Blocks, blockedID)
 		}
 
-		// A step is ready if it's open/in_progress and has no open blockers
+		// A step is ready if it's open/in_progress and has no current blockers.
 		info.IsReady = (issue.Status == types.StatusOpen || issue.Status == types.StatusInProgress) &&
 			len(info.BlockedBy) == 0
 
@@ -384,13 +396,9 @@ func calculateBlockingDepths(subgraph *MoleculeSubgraph, blockedBy map[string]ma
 
 		maxBlockerDepth := -1
 		for blockerID := range blockedBy[id] {
-			// Only count open blockers
-			blocker := subgraph.IssueMap[blockerID]
-			if blocker != nil && blocker.Status != types.StatusClosed {
-				blockerDepth := calculateDepth(blockerID)
-				if blockerDepth > maxBlockerDepth {
-					maxBlockerDepth = blockerDepth
-				}
+			blockerDepth := calculateDepth(blockerID)
+			if blockerDepth > maxBlockerDepth {
+				maxBlockerDepth = blockerDepth
 			}
 		}
 

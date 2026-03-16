@@ -882,6 +882,30 @@ func TestIsFailureClose(t *testing.T) {
 	}
 }
 
+func TestConditionalBlocksReadyBlocked(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      Status
+		closeReason string
+		want        bool
+	}{
+		{name: "open blocker still blocks", status: StatusOpen, want: true},
+		{name: "custom active blocker still blocks", status: Status("review"), want: true},
+		{name: "successful close stays blocked", status: StatusClosed, closeReason: "Completed", want: true},
+		{name: "failure close unblocks", status: StatusClosed, closeReason: "failed due to timeout", want: false},
+		{name: "pinned blocker does not block", status: StatusPinned, want: false},
+		{name: "missing blocker does not block", status: "", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ConditionalBlocksReadyBlocked(tt.status, tt.closeReason); got != tt.want {
+				t.Errorf("ConditionalBlocksReadyBlocked(%q, %q) = %v, want %v", tt.status, tt.closeReason, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIssueStructFields(t *testing.T) {
 	// Test that all time fields work correctly
 	now := time.Now()

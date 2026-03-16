@@ -581,6 +581,108 @@ func TestGetNewlyUnblockedByClose_ClosedDependent(t *testing.T) {
 	}
 }
 
+func TestGetNewlyUnblockedByClose_ConditionalBlocksFailure(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	precondition := &types.Issue{
+		ID:        "unblock-cond-fail-pre",
+		Title:     "Precondition",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+	}
+	fallback := &types.Issue{
+		ID:        "unblock-cond-fail-fallback",
+		Title:     "Fallback",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+
+	for _, issue := range []*types.Issue{precondition, fallback} {
+		if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
+			t.Fatalf("failed to create issue: %v", err)
+		}
+	}
+
+	if err := store.AddDependency(ctx, &types.Dependency{
+		IssueID:     fallback.ID,
+		DependsOnID: precondition.ID,
+		Type:        types.DepConditionalBlocks,
+	}, "tester"); err != nil {
+		t.Fatalf("failed to add dependency: %v", err)
+	}
+
+	if err := store.CloseIssue(ctx, precondition.ID, "failed", "tester", "s1"); err != nil {
+		t.Fatalf("failed to close precondition: %v", err)
+	}
+
+	unblocked, err := store.GetNewlyUnblockedByClose(ctx, precondition.ID)
+	if err != nil {
+		t.Fatalf("GetNewlyUnblockedByClose failed: %v", err)
+	}
+
+	if len(unblocked) != 1 {
+		t.Fatalf("expected 1 newly unblocked issue, got %d", len(unblocked))
+	}
+	if unblocked[0].ID != fallback.ID {
+		t.Fatalf("expected %q to be newly unblocked, got %q", fallback.ID, unblocked[0].ID)
+	}
+}
+
+func TestGetNewlyUnblockedByClose_ConditionalBlocksSuccess(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	precondition := &types.Issue{
+		ID:        "unblock-cond-success-pre",
+		Title:     "Precondition",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+	}
+	fallback := &types.Issue{
+		ID:        "unblock-cond-success-fallback",
+		Title:     "Fallback",
+		Status:    types.StatusOpen,
+		Priority:  2,
+		IssueType: types.TypeTask,
+	}
+
+	for _, issue := range []*types.Issue{precondition, fallback} {
+		if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
+			t.Fatalf("failed to create issue: %v", err)
+		}
+	}
+
+	if err := store.AddDependency(ctx, &types.Dependency{
+		IssueID:     fallback.ID,
+		DependsOnID: precondition.ID,
+		Type:        types.DepConditionalBlocks,
+	}, "tester"); err != nil {
+		t.Fatalf("failed to add dependency: %v", err)
+	}
+
+	if err := store.CloseIssue(ctx, precondition.ID, "Completed", "tester", "s1"); err != nil {
+		t.Fatalf("failed to close precondition: %v", err)
+	}
+
+	unblocked, err := store.GetNewlyUnblockedByClose(ctx, precondition.ID)
+	if err != nil {
+		t.Fatalf("GetNewlyUnblockedByClose failed: %v", err)
+	}
+	if len(unblocked) != 0 {
+		t.Fatalf("expected 0 newly unblocked issues, got %d", len(unblocked))
+	}
+}
+
 // =============================================================================
 // Custom Status Visibility Tests (bd-1x0)
 // =============================================================================
